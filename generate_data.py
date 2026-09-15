@@ -97,6 +97,12 @@ BATCH_SIZE    = 5                  # số samples mỗi lần gọi API
 # Ví dụ: quota 200k TPD, mỗi request ~500 tokens → đặt 350 để an toàn.
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "0"))
 
+# ── Proactive RPM throttle ────────────────────────────────────────
+# qwen/qwen3.8-27b: 30 RPM → min ~2s between requests để tránh burst.
+# Điều chỉnh MIN_REQUEST_INTERVAL nếu dùng model khác.
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "2.5"))  # giây
+_last_request_time: float = 0.0  # timestamp của request gần nhất
+
 # Diversity / dedup
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # cosine sim >= ngưỡng này → near-duplicate
 RECENT_QUESTIONS_WINDOW    = 20    # inject N câu gần nhất vào prompt để tránh lặp
@@ -324,23 +330,67 @@ Chỉ trả về JSON array, không giải thích gì thêm."""
 # RATE-LIMIT EXCEPTION
 # ─────────────────────────────────────────────
 class RateLimitHit(Exception):
-    """Raise khi API trả về 429 — signal để dừng gracefully và lưu progress."""
+    """Raise khi API trả về 429 liên tục vượt quá số retry cho phép."""
     def __init__(self, retry_after: float = 0):
         self.retry_after = retry_after  # giây cần chờ (từ header hoặc message)
         super().__init__(f"Rate limit reached. Retry after {retry_after:.0f}s")
 
 
+def _parse_retry_after(err_str: str) -> float:
+    """
+    Parse thời gian chờ retry từ error message của Groq.
+
+    Groq thường trả về các định dạng:
+      - "Please try again in 2m30s"  → 150.0
+      - "try again in 45.5s"          → 45.5
+      - "retry after 60 seconds"      → 60.0
+      - "rate_limit_exceeded"         → 0.0 (fallback)
+    """
+    # Dạng "XmYs" hoặc "Xm Ys" (ví dụ: "2m30s", "1m 5.2s")
+    m = re.search(r"(\d+)\s*m(?:in)?\s*(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) * 60 + float(m.group(2))
+
+    # Dạng chỉ phút: "2m"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*m(?:in)?(?:ute)?s?\b", err_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) * 60
+
+    # Dạng chỉ giây: "45s", "45 seconds", "45.5s"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+
+    return 0.0
+
+
 # ─────────────────────────────────────────────
 # API CALL WITH RETRY
 # ─────────────────────────────────────────────
-def call_gpt(prompt: str, max_retries: int = 3) -> Optional[str]:
+def call_gpt(prompt: str, max_retries: int = 5) -> Optional[str]:
     """
-    Gọi LLM API.
-    - Retry tối đa max_retries lần với exponential backoff.
-    - Nếu gặp 429 (rate limit) → raise RateLimitHit ngay, không retry.
+    Gọi LLM API với proactive throttle + smart retry cho 429.
+
+    Chiến lược:
+    - Đảm bảo MIN_REQUEST_INTERVAL giây giữa các request (tránh burst).
+    - Nếu gặp 429: wait đúng retry-after rồi thử lại (tối đa 3 lần).
+    - Nếu retry_after = 0 (parse fail): dùng exponential backoff 10s → 20s → 40s.
+    - Sau khi hết retry vẫn 429 → raise RateLimitHit (dừng graceful).
+    - Các lỗi khác (5xx, timeout): exponential backoff ngắn rồi retry.
     """
+    global _last_request_time
+
+    # ── Proactive throttle: đảm bảo khoảng cách tối thiểu giữa requests ──
+    elapsed = time.monotonic() - _last_request_time
+    if elapsed < MIN_REQUEST_INTERVAL:
+        time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+
+    rate_limit_attempts = 0
+    max_rate_limit_retries = 3  # số lần retry khi gặp 429 trước khi báo dừng
+
     for attempt in range(max_retries):
         try:
+            _last_request_time = time.monotonic()
             response = client.chat.completions.create(
                 model=MODEL,
                 temperature=TEMPERATURE,
@@ -350,19 +400,34 @@ def call_gpt(prompt: str, max_retries: int = 3) -> Optional[str]:
                 ],
             )
             return response.choices[0].message.content
+
         except Exception as e:
             err_str = str(e)
-            # Detect 429 rate-limit → dừng ngay, không retry
-            if "429" in err_str or "rate_limit_exceeded" in err_str or "Rate limit" in err_str:
-                # Cố parse retry-after từ message
-                retry_after = 0.0
-                m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m(?:in)?)?\s*s(?:econds?)?", err_str)
-                if m:
-                    retry_after = float(m.group(1))
-                raise RateLimitHit(retry_after)
+
+            # ── 429 Rate limit ────────────────────────────────────────
+            if "429" in err_str or "rate_limit_exceeded" in err_str or "rate limit" in err_str.lower():
+                rate_limit_attempts += 1
+                retry_after = _parse_retry_after(err_str)
+
+                if rate_limit_attempts >= max_rate_limit_retries:
+                    # Đã retry đủ lần → báo dừng graceful
+                    raise RateLimitHit(retry_after)
+
+                # Fallback: nếu parse được 0s thì dùng backoff 10s, 20s, 40s
+                wait = retry_after if retry_after > 0 else (10 * (2 ** (rate_limit_attempts - 1)))
+                print(
+                    f" \n⚠ 429 Rate limit (lần {rate_limit_attempts}/{max_rate_limit_retries}): "
+                    f"chờ {wait:.0f}s rồi retry... | raw: {err_str[:120]}"
+                )
+                time.sleep(wait)
+                _last_request_time = time.monotonic()  # reset sau khi chờ
+                continue
+
+            # ── Lỗi khác (5xx, timeout, network) ─────────────────────
             wait = 2 ** attempt
-            print(f"  ⚠ API error (attempt {attempt+1}): {e}. Retry in {wait}s...")
+            print(f"  \n⚠ API error (attempt {attempt+1}/{max_retries}): {e}. Retry in {wait}s...")
             time.sleep(wait)
+
     return None
 
 
