@@ -1,32 +1,32 @@
 """
 generate_data.py
 ================
-Sinh dataset Text-to-SQL cho Koel Music Streaming DB.
+Generate a Text-to-SQL dataset for the Koel Music Streaming DB.
 Output: data/raw_samples.jsonl
 
-Yêu cầu cơ bản:
+Basic requirements:
     pip install openai tqdm python-dotenv
 
-Yêu cầu mở rộng (optional features):
+Optional features:
     pip install sentence-transformers     # semantic dedup
     pip install pyodbc                    # SQL execution validation (--validate-sql, Windows only)
 
-Cấu hình (.env):
-    OPENAI_API_KEY=gsk_...               # Groq API key (lấy tại console.groq.com)
+Configuration (.env):
+    OPENAI_API_KEY=gsk_...               # Groq API key (get it at console.groq.com)
     LLM_BASE_URL=https://api.groq.com/openai/v1
     LLM_MODEL=qwen/qwen3.8-27b
     SQL_CONN_STR=Driver={ODBC Driver 17 for SQL Server};Server=localhost;Database=music_14_09_2026;UID=sa;PWD=Aa123456@;
 
-    # Giới hạn request mỗi phiên chạy (dừng chủ động trước khi bị rate-limit):
-    DAILY_REQUEST_LIMIT=0   # 0 = không giới hạn; đặt VD 800 nếu quota/ngày là 1000 req
+    # Maximum requests per session (stop proactively before hitting rate-limit):
+    DAILY_REQUEST_LIMIT=0   # 0 = unlimited; set e.g. 800 if daily quota is 1000 req
 
-Resume sau rate-limit:
-    Script tự lưu progress vào data/progress.json sau mỗi sample.
-    Khi bị 429 hoặc đạt DAILY_REQUEST_LIMIT, tự lưu & dừng gracefully.
-    Chạy lại cùng lệnh → tự tiếp tục từ chỗ dở, không sinh lại data đã có.
-    Xóa data/progress.json để bắt đầu lại từ đầu.
+Resume after rate-limit:
+    The script saves progress to data/progress.json after every sample.
+    On 429 or when DAILY_REQUEST_LIMIT is reached, it saves state and stops gracefully.
+    Re-run the same command -> resumes from where it left off, no data re-generated.
+    Delete data/progress.json to start over from scratch.
 
---validate-sql chỉ chạy trên Windows (cần ODBC Driver 17 for SQL Server cài sẵn qua SSMS).
+--validate-sql only works on Windows (requires ODBC Driver 17 for SQL Server, installed via SSMS).
 """
 
 import json
@@ -42,10 +42,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
 
-# ── Optional dependencies (sentence_transformers imported AFTER HF_TOKEN set) ──
-# Import được delay xuống dưới load_dotenv() để HF_TOKEN có mặt trước khi
-# sentence_transformers khởi tạo HF Hub client.
-_SEMANTIC_AVAILABLE = False  # sẽ được override bên dưới sau khi set token
+# ── Optional dependencies (sentence_transformers imported AFTER HF_TOKEN is set) ──
+# Import is delayed until after load_dotenv() so HF_TOKEN is available before
+# sentence_transformers initializes the HF Hub client.
+_SEMANTIC_AVAILABLE = False  # will be overridden below after token is set
 
 try:
     import pyodbc
@@ -56,13 +56,13 @@ except ImportError:
 load_dotenv()
 
 # ── Hugging Face token (sentence-transformers dedup model) ───────
-# Tránh warning "unauthenticated requests" và rate-limit thấp khi tải model.
+# Avoids "unauthenticated requests" warnings and low rate-limits when downloading the model.
 _hf_token = os.getenv("HF_TOKEN")
 if _hf_token and _hf_token != "hf_your_token_here":
     os.environ["HF_TOKEN"] = _hf_token          # huggingface_hub >= 0.17
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token  # fallback cũ
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token  # legacy fallback
 
-# Import sentence_transformers SAU KHI token đã được set
+# Import sentence_transformers AFTER token has been set
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -79,36 +79,36 @@ OUTPUT_DIR = Path("data")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 RAW_OUTPUT      = OUTPUT_DIR / "raw_samples.jsonl"
-PROGRESS_FILE   = OUTPUT_DIR / "progress.json"   # lưu state để resume
+PROGRESS_FILE   = OUTPUT_DIR / "progress.json"   # saves state for resume
 VALID_OUTPUT    = OUTPUT_DIR / "valid_samples.jsonl"
 TRAIN_OUTPUT    = OUTPUT_DIR / "train.jsonl"
 VAL_OUTPUT      = OUTPUT_DIR / "val.jsonl"
 TEST_OUTPUT     = OUTPUT_DIR / "test.jsonl"
 
-# ── LLM Provider (đọc từ .env, mặc định Groq) ───────────────────
+# ── LLM Provider (read from .env, defaults to Groq) ───────────────────
 LLM_BASE_URL  = os.getenv("LLM_BASE_URL",  "https://api.groq.com/openai/v1")
 MODEL         = os.getenv("LLM_MODEL",     "qwen/qwen3.8-27b")
 TEMPERATURE   = 0.7
-BATCH_SIZE    = 5                  # số samples mỗi lần gọi API
+BATCH_SIZE    = 5                  # number of samples per API call
 
 # ── Rate-limit / quota guard ─────────────────────────────────────
-# Đặt số request tối đa mỗi phiên chạy.
-# 0 = không giới hạn (chạy đến khi xong hoặc bị 429).
-# Ví dụ: quota 200k TPD, mỗi request ~500 tokens → đặt 350 để an toàn.
+# Set the maximum number of requests per session.
+# 0 = unlimited (run until done or until a 429 is received).
+# Example: quota 200k TPD, ~500 tokens per request -> set 350 to be safe.
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "0"))
 
 # ── Proactive RPM throttle ────────────────────────────────────────
-# qwen/qwen3.8-27b: 30 RPM → min ~2s between requests để tránh burst.
-# Điều chỉnh MIN_REQUEST_INTERVAL nếu dùng model khác.
-MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "2.5"))  # giây
-_last_request_time: float = 0.0  # timestamp của request gần nhất
+# qwen/qwen3.8-27b: 30 RPM -> min ~2s between requests to avoid bursting.
+# Adjust MIN_REQUEST_INTERVAL if using a different model.
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "2.5"))  # seconds
+_last_request_time: float = 0.0  # timestamp of the most recent request
 
 # Diversity / dedup
-DEDUP_SIMILARITY_THRESHOLD = 0.92  # cosine sim >= ngưỡng này → near-duplicate
-RECENT_QUESTIONS_WINDOW    = 20    # inject N câu gần nhất vào prompt để tránh lặp
+DEDUP_SIMILARITY_THRESHOLD = 0.92  # cosine sim >= this threshold -> near-duplicate
+RECENT_QUESTIONS_WINDOW    = 20    # inject N recent questions into prompt to avoid repetition
 
-# SQL execution validation (Windows only — cần ODBC Driver 17 for SQL Server)
-SQL_CONN_STR  = os.getenv("SQL_CONN_STR", "")  # để trống nếu không dùng --validate-sql
+# SQL execution validation (Windows only — requires ODBC Driver 17 for SQL Server)
+SQL_CONN_STR  = os.getenv("SQL_CONN_STR", "")  # leave empty if not using --validate-sql
 
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -144,11 +144,11 @@ TABLE themes(id PK, user_id INT, name)
 TABLE transcodes(id PK, song_id, bit_rate INT, file_size BIGINT)
 
 NOTES:
-- Dialect: T-SQL (SQL Server). Dùng TOP N thay vì LIMIT. Dùng GETDATE() thay vì NOW().
-- songs.length tính bằng giây (seconds). 1 phút = 60 giây.
-- favorites.favoriteable_type = 'playable' cho songs.
-- ratings.rateable_type = 'song' cho songs.
-- playlist_user.role: 'owner' = chủ sở hữu, 'collaborator' = cộng tác viên.
+- Dialect: T-SQL (SQL Server). Use TOP N instead of LIMIT. Use GETDATE() instead of NOW().
+- songs.length is in seconds. 1 minute = 60 seconds.
+- favorites.favoriteable_type = 'playable' for songs.
+- ratings.rateable_type = 'song' for songs.
+- playlist_user.role: 'owner' = playlist owner, 'collaborator' = collaborator.
 """.strip()
 
 # ─────────────────────────────────────────────
@@ -173,8 +173,11 @@ SCHEMA:
 TIERS = [
     {
         "id": "T1",
-        "count": 900,   # ↑ từ 600
+        "count": 900,   # ↑ from 600
         "label": "Single table, simple SELECT",
+        # Simple SQL: short output (~50-80 tokens/sample) -> batch=5 is fine within 1000 OTPM
+        "batch_size": 5,
+        "min_interval": 2.5,  # seconds between requests
         "examples": [
             "Liệt kê tất cả nghệ sĩ theo thứ tự tên",
             "Có bao nhiêu bài hát trong hệ thống?",
@@ -190,8 +193,11 @@ TIERS = [
     },
     {
         "id": "T2",
-        "count": 1100,  # ↑ từ 800
+        "count": 1100,  # ↑ from 800
         "label": "WHERE, ORDER BY, GROUP BY, Aggregation",
+        # Moderate SQL length (~80-120 tokens/sample) -> batch=5 still safe
+        "batch_size": 5,
+        "min_interval": 2.5,
         "examples": [
             "Album nào được phát hành sau năm 2015?",
             "Bài hát dài hơn 5 phút có những bài nào?",
@@ -207,8 +213,11 @@ TIERS = [
     },
     {
         "id": "T3",
-        "count": 1000,  # ↑ từ 700
+        "count": 1000,  # ↑ from 700
         "label": "2-table JOIN",
+        # 2-table JOIN: ~100-150 tokens/sample -> batch=5 -> ~500-750 tokens/req, borderline
+        "batch_size": 4,
+        "min_interval": 5.0,  # slightly slower to avoid OTPM spikes
         "examples": [
             "Liệt kê tên bài hát cùng tên nghệ sĩ",
             "Mỗi album có bao nhiêu bài hát?",
@@ -224,8 +233,12 @@ TIERS = [
     },
     {
         "id": "T4",
-        "count": 800,   # ↑ từ 600
+        "count": 800,   # ↑ from 600
         "label": "Multi-table JOIN (3+ tables)",
+        # Complex SQL: ~150-250 tokens/sample -> batch=3 -> ~450-750 tokens/req
+        # With 1000 OTPM limit: need >= 45s between requests to be safe
+        "batch_size": 3,
+        "min_interval": 20.0,  # ~3 req/min -> max 750 output tokens/min
         "examples": [
             "Top 10 bài hát được nghe nhiều nhất, kèm tên nghệ sĩ và album",
             "Bài hát thuộc thể loại Synthwave là những bài nào, tên nghệ sĩ là ai?",
@@ -239,8 +252,11 @@ TIERS = [
     },
     {
         "id": "T5",
-        "count": 600,   # ↑ từ 400
+        "count": 600,   # ↑ from 400
         "label": "Subquery, CTE, HAVING",
+        # Subquery/CTE: ~150-250 tokens/sample, same risk as T4
+        "batch_size": 3,
+        "min_interval": 20.0,
         "examples": [
             "Nghệ sĩ nào có trung bình số bài mỗi album cao nhất?",
             "User nào nghe nhiều hơn mức trung bình?",
@@ -253,8 +269,11 @@ TIERS = [
     },
     {
         "id": "T6",
-        "count": 325,   # ↑ từ 200
+        "count": 325,   # ↑ from 200
         "label": "Window Functions, Ranking",
+        # Window functions: ~200-300 tokens/sample (verbose SQL with OVER/PARTITION BY)
+        "batch_size": 2,
+        "min_interval": 25.0,  # ~2.4 req/min -> max 600 output tokens/min
         "examples": [
             "Xếp hạng bài hát theo lượt nghe trong từng thể loại",
             "Tính thứ hạng nghệ sĩ theo số album",
@@ -265,8 +284,11 @@ TIERS = [
     },
     {
         "id": "T7",
-        "count": 275,   # ↑ từ 200
+        "count": 275,   # ↑ from 200
         "label": "Negative / Refusal cases",
+        # Refusal responses are very short (~20-30 tokens each) -> batch=5 is fine
+        "batch_size": 5,
+        "min_interval": 5.0,
         "examples": [
             "Xóa tất cả bài hát của Radiohead",
             "Cập nhật tên nghệ sĩ thành 'Unknown'",
@@ -279,7 +301,7 @@ TIERS = [
         ],
     },
 ]
-# Tổng: 900+1100+1000+800+600+325+275 = 5000
+# Total: 900+1100+1000+800+600+325+275 = 5000
 
 
 # ─────────────────────────────────────────────
@@ -292,7 +314,7 @@ def build_generation_prompt(
 ) -> str:
     examples_str = "\n".join(f"  - {e}" for e in tier["examples"])
 
-    # Inject danh sách câu hỏi đã sinh để GPT tránh paraphrase lại
+    # Inject list of already-generated questions so the LLM avoids paraphrasing them
     avoid_block = ""
     if recent_questions:
         avoid_list = "\n".join(f"  - {q}" for q in recent_questions[-RECENT_QUESTIONS_WINDOW:])
@@ -330,33 +352,33 @@ Chỉ trả về JSON array, không giải thích gì thêm."""
 # RATE-LIMIT EXCEPTION
 # ─────────────────────────────────────────────
 class RateLimitHit(Exception):
-    """Raise khi API trả về 429 liên tục vượt quá số retry cho phép."""
+    """Raised when the API returns 429 repeatedly beyond the allowed retry count."""
     def __init__(self, retry_after: float = 0):
-        self.retry_after = retry_after  # giây cần chờ (từ header hoặc message)
+        self.retry_after = retry_after  # seconds to wait (from header or message)
         super().__init__(f"Rate limit reached. Retry after {retry_after:.0f}s")
 
 
 def _parse_retry_after(err_str: str) -> float:
     """
-    Parse thời gian chờ retry từ error message của Groq.
+    Parse the retry wait time from a Groq error message.
 
-    Groq thường trả về các định dạng:
-      - "Please try again in 2m30s"  → 150.0
-      - "try again in 45.5s"          → 45.5
-      - "retry after 60 seconds"      → 60.0
-      - "rate_limit_exceeded"         → 0.0 (fallback)
+    Groq typically returns formats like:
+      - "Please try again in 2m30s"  -> 150.0
+      - "try again in 45.5s"          -> 45.5
+      - "retry after 60 seconds"      -> 60.0
+      - "rate_limit_exceeded"         -> 0.0 (fallback)
     """
-    # Dạng "XmYs" hoặc "Xm Ys" (ví dụ: "2m30s", "1m 5.2s")
+    # Format "XmYs" or "Xm Ys" (e.g. "2m30s", "1m 5.2s")
     m = re.search(r"(\d+)\s*m(?:in)?\s*(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 60 + float(m.group(2))
 
-    # Dạng chỉ phút: "2m"
+    # Minutes only: "2m"
     m = re.search(r"(\d+(?:\.\d+)?)\s*m(?:in)?(?:ute)?s?\b", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 60
 
-    # Dạng chỉ giây: "45s", "45 seconds", "45.5s"
+    # Seconds only: "45s", "45 seconds", "45.5s"
     m = re.search(r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1))
@@ -369,24 +391,24 @@ def _parse_retry_after(err_str: str) -> float:
 # ─────────────────────────────────────────────
 def call_gpt(prompt: str, max_retries: int = 5) -> Optional[str]:
     """
-    Gọi LLM API với proactive throttle + smart retry cho 429.
+    Call the LLM API with proactive throttling and smart retry on 429.
 
-    Chiến lược:
-    - Đảm bảo MIN_REQUEST_INTERVAL giây giữa các request (tránh burst).
-    - Nếu gặp 429: wait đúng retry-after rồi thử lại (tối đa 3 lần).
-    - Nếu retry_after = 0 (parse fail): dùng exponential backoff 10s → 20s → 40s.
-    - Sau khi hết retry vẫn 429 → raise RateLimitHit (dừng graceful).
-    - Các lỗi khác (5xx, timeout): exponential backoff ngắn rồi retry.
+    Strategy:
+    - Ensure MIN_REQUEST_INTERVAL seconds between requests (avoids bursting).
+    - On 429: wait exactly retry-after seconds then retry (up to 3 times).
+    - If retry_after = 0 (parse failed): use exponential backoff 10s -> 20s -> 40s.
+    - After exhausting retries on 429 -> raise RateLimitHit (graceful stop).
+    - Other errors (5xx, timeout): short exponential backoff then retry.
     """
     global _last_request_time
 
-    # ── Proactive throttle: đảm bảo khoảng cách tối thiểu giữa requests ──
+    # ── Proactive throttle: enforce minimum gap between requests ──
     elapsed = time.monotonic() - _last_request_time
     if elapsed < MIN_REQUEST_INTERVAL:
         time.sleep(MIN_REQUEST_INTERVAL - elapsed)
 
     rate_limit_attempts = 0
-    max_rate_limit_retries = 3  # số lần retry khi gặp 429 trước khi báo dừng
+    max_rate_limit_retries = 3  # number of 429 retries before signalling a stop
 
     for attempt in range(max_retries):
         try:
@@ -410,20 +432,20 @@ def call_gpt(prompt: str, max_retries: int = 5) -> Optional[str]:
                 retry_after = _parse_retry_after(err_str)
 
                 if rate_limit_attempts >= max_rate_limit_retries:
-                    # Đã retry đủ lần → báo dừng graceful
+                    # Exhausted retries -> signal graceful stop
                     raise RateLimitHit(retry_after)
 
-                # Fallback: nếu parse được 0s thì dùng backoff 10s, 20s, 40s
+                # Fallback: if parse returns 0s, use backoff 10s, 20s, 40s
                 wait = retry_after if retry_after > 0 else (10 * (2 ** (rate_limit_attempts - 1)))
                 print(
-                    f" \n⚠ 429 Rate limit (lần {rate_limit_attempts}/{max_rate_limit_retries}): "
-                    f"chờ {wait:.0f}s rồi retry... | raw: {err_str[:120]}"
+                    f" \n⚠ 429 Rate limit (attempt {rate_limit_attempts}/{max_rate_limit_retries}): "
+                    f"waiting {wait:.0f}s then retrying... | raw: {err_str[:120]}"
                 )
                 time.sleep(wait)
-                _last_request_time = time.monotonic()  # reset sau khi chờ
+                _last_request_time = time.monotonic()  # reset after waiting
                 continue
 
-            # ── Lỗi khác (5xx, timeout, network) ─────────────────────
+            # ── Other errors (5xx, timeout, network) ─────────────────────
             wait = 2 ** attempt
             print(f"  \n⚠ API error (attempt {attempt+1}/{max_retries}): {e}. Retry in {wait}s...")
             time.sleep(wait)
@@ -505,15 +527,15 @@ def build_sample(question: str, sql: str) -> dict:
 # ─────────────────────────────────────────────
 def semantic_dedup(samples: list[dict], threshold: float = DEDUP_SIMILARITY_THRESHOLD) -> list[dict]:
     """
-    Loại bỏ near-duplicate dựa trên cosine similarity của question embeddings.
-    Exact-string dedup (trong generation loop) chỉ bắt được duplicate 100%,
-    còn function này bắt được paraphrase (vd: 'dài hơn 5 phút' vs 'trên 5 phút').
+    Remove near-duplicates based on cosine similarity of question embeddings.
+    Exact-string dedup (in the generation loop) only catches 100% duplicates;
+    this function catches paraphrases (e.g. 'longer than 5 minutes' vs 'over 5 minutes').
 
-    Yêu cầu: pip install sentence-transformers scikit-learn numpy
+    Requires: pip install sentence-transformers scikit-learn numpy
     """
     if not _SEMANTIC_AVAILABLE:
-        print("⚠️  sentence-transformers không có → bỏ qua semantic dedup. "
-              "Chạy: pip install sentence-transformers")
+        print("⚠️  sentence-transformers not available -> skipping semantic dedup. "
+              "Run: pip install sentence-transformers")
         return samples
 
     print(f"\n🔍 Semantic dedup (threshold={threshold})...")
@@ -526,7 +548,7 @@ def semantic_dedup(samples: list[dict], threshold: float = DEDUP_SIMILARITY_THRE
     keep_flags = [True] * len(samples)
     removed    = 0
 
-    # O(n²) — acceptable cho dataset < 10k
+    # O(n²) — acceptable for datasets < 10k
     sim_matrix = cosine_similarity(embeddings)
 
     for i in range(len(samples)):
@@ -561,7 +583,7 @@ SQL_OPERATORS_TRACKED = [
 ]
 
 def report_operator_coverage(samples: list[dict]) -> None:
-    """In bảng phân phối SQL operator. Warn nếu operator nào < 3%."""
+    """Print SQL operator distribution table. Warn if any operator is < 3%."""
     sql_samples = [
         s["messages"][2]["content"]
         for s in samples
@@ -593,10 +615,10 @@ def report_operator_coverage(samples: list[dict]) -> None:
 # ─────────────────────────────────────────────
 def validate_sql_on_db(sql: str, conn_str: str) -> tuple[bool, str]:
     """
-    Chạy SQL với SET NOEXEC ON để kiểm tra syntax + schema mà không thực thi.
-    Trả về (True, "") nếu hợp lệ, hoặc (False, error_message).
+    Execute SQL with SET NOEXEC ON to check syntax and schema without actually running it.
+    Returns (True, "") if valid, or (False, error_message) otherwise.
 
-    Yêu cầu: pip install pyodbc + SQL Server connection string trong .env
+    Requires: pip install pyodbc + SQL Server connection string in .env
     """
     if not _PYODBC_AVAILABLE:
         return True, "pyodbc not installed"
@@ -616,14 +638,14 @@ def validate_sql_on_db(sql: str, conn_str: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 def load_progress() -> dict:
     """
-    Đọc progress.json để resume từ lần chạy trước.
-    Trả về dict:
+    Read progress.json to resume from a previous run.
+    Returns a dict:
       {
-        "completed_tiers": ["T1", "T2"],   # tiers đã hoàn thành
-        "current_tier": "T3",              # tier đang chạy dở
-        "current_generated": 150,           # số samples đã sinh trong tier hiện tại
-        "seen_questions": ["câu 1", ...],   # danh sách câu đã sinh (lowercase)
-        "recent_questions": ["câu", ...],   # sliding window
+        "completed_tiers": ["T1", "T2"],   # tiers that have been completed
+        "current_tier": "T3",              # tier currently in progress
+        "current_generated": 150,           # samples generated in the current tier
+        "seen_questions": ["q1", ...],      # list of all generated questions (lowercase)
+        "recent_questions": ["q", ...],     # sliding window
         "db_ok": 0, "db_fail": 0
       }
     """
@@ -637,7 +659,7 @@ def load_progress() -> dict:
                   f"current_generated={data.get('current_generated', 0)}")
             return data
         except Exception as e:
-            print(f"⚠️  Không đọc được progress.json ({e}) → bắt đầu từ đầu.")
+            print(f"⚠️  Could not read progress.json ({e}) -> starting from scratch.")
     return {
         "completed_tiers": [],
         "current_tier": None,
@@ -650,13 +672,13 @@ def load_progress() -> dict:
 
 
 def save_progress(progress: dict) -> None:
-    """Ghi progress xuống disk sau mỗi sample."""
+    """Write progress to disk after every sample."""
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump(progress, f, ensure_ascii=False, indent=2)
 
 
 def append_sample_to_file(sample: dict) -> None:
-    """Append một sample vào raw_samples.jsonl (không overwrite)."""
+    """Append a single sample to raw_samples.jsonl (non-destructive)."""
     with open(RAW_OUTPUT, "a", encoding="utf-8") as f:
         f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
@@ -666,30 +688,31 @@ def append_sample_to_file(sample: dict) -> None:
 # ─────────────────────────────────────────────
 def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
     """
-    Sinh dataset theo từng tier với khả năng resume sau rate-limit.
+    Generate the dataset tier by tier with resume support after rate-limiting.
 
-    Cơ chế:
-    - Load progress từ data/progress.json nếu tồn tại.
-    - Sau mỗi sample được lưu: append vào raw_samples.jsonl + cập nhật progress.json.
-    - Khi gặp 429 (RateLimitHit) hoặc đạt DAILY_REQUEST_LIMIT:
-        → lưu state và dừng gracefully.
-    - Lần chạy sau: đọc progress, skip các tier đã xong,
-        tiếp tục tier đang dở từ đúng số samples đã có.
+    Mechanism:
+    - Load progress from data/progress.json if it exists.
+    - After each saved sample: append to raw_samples.jsonl and update progress.json.
+    - On 429 (RateLimitHit) or when DAILY_REQUEST_LIMIT is reached:
+        -> save state and stop gracefully.
+    - On the next run: read progress, skip completed tiers,
+        and continue the in-progress tier from exactly where it left off.
 
     Args:
-        validate_sql_db: Nếu True, chạy SET NOEXEC ON trên DB thật để
-                         validate SQL syntax + schema (yêu cầu SQL_CONN_STR).
+        validate_sql_db: If True, run SET NOEXEC ON against the real DB to
+                         validate SQL syntax + schema (requires SQL_CONN_STR).
     """
     # ── Load progress ──────────────────────────────────────────────
+
     progress = load_progress()
     completed_tiers:  list[str] = progress["completed_tiers"]
     seen_questions:   set[str]  = set(progress["seen_questions"])
     recent_questions: list[str] = progress["recent_questions"]
     db_ok   = progress["db_ok"]
     db_fail = progress["db_fail"]
-    request_count = 0  # đếm request trong phiên chạy này
+    request_count = 0  # count requests in this session
 
-    # ── Load existing samples từ file (để trả về sau khi done) ────
+    # ── Load existing samples from file (to return once done) ────
     all_samples: list[dict] = []
     if RAW_OUTPUT.exists():
         with open(RAW_OUTPUT, encoding="utf-8") as f:
@@ -700,24 +723,24 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         print(f"📄 Loaded {len(all_samples)} existing samples from {RAW_OUTPUT}")
 
     if validate_sql_db and not SQL_CONN_STR:
-        print("⚠️  --validate-sql được bật nhưng SQL_CONN_STR chưa cấu hình trong .env → bỏ qua.")
+        print("⚠️  --validate-sql is enabled but SQL_CONN_STR is not configured in .env -> skipping.")
         validate_sql_db = False
 
-    rate_limited = False  # flag: dừng do rate-limit
+    rate_limited = False  # flag: stopped due to rate-limiting
 
     for tier in TIERS:
         tier_id = tier["id"]
         target  = tier["count"]
         label   = tier["label"]
 
-        # ── Skip tier đã hoàn thành ────────────────────────────────
+        # ── Skip completed tiers ────────────────────────────────
         if tier_id in completed_tiers:
-            print(f"\n⏭  Tier {tier_id} ({label}): đã hoàn thành, skip.")
+            print(f"\n⏭  Tier {tier_id} ({label}): already completed, skipping.")
             continue
 
-        # ── Tính số samples đã có của tier này ─────────────────────
+        # ── Count samples already generated for this tier ─────────────────────
         generated = sum(1 for s in all_samples if s.get("_tier") == tier_id)
-        # Nếu đang ở tier dở dang, lấy số từ progress để chính xác hơn
+        # If this is the in-progress tier, prefer the count from progress for accuracy
         if progress["current_tier"] == tier_id:
             generated = max(generated, progress["current_generated"])
 
@@ -727,7 +750,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         print(f"{'='*60}")
 
         if generated >= target:
-            print(f"  ✓ Tier {tier_id} đã đủ samples, đánh dấu hoàn thành.")
+            print(f"  ✓ Tier {tier_id} already has enough samples, marking as complete.")
             if tier_id not in completed_tiers:
                 completed_tiers.append(tier_id)
             progress["completed_tiers"] = completed_tiers
@@ -736,7 +759,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
             save_progress(progress)
             continue
 
-        # Cập nhật current tier vào progress
+        # Update current tier in progress
         progress["current_tier"] = tier_id
         progress["current_generated"] = generated
         save_progress(progress)
@@ -744,15 +767,17 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         pbar = tqdm(total=target, initial=generated, desc=f"  T{tier_id}")
 
         while generated < target:
-            # ── Kiểm tra request limit trước khi gọi API ───────────
+            # ── Check request limit before calling the API ───────────
             if DAILY_REQUEST_LIMIT > 0 and request_count >= DAILY_REQUEST_LIMIT:
-                tqdm.write(f"\n🛑 Đã đạt DAILY_REQUEST_LIMIT ({DAILY_REQUEST_LIMIT} requests). "
-                           f"Lưu progress và dừng.")
+                tqdm.write(f"\n🛑 Reached DAILY_REQUEST_LIMIT ({DAILY_REQUEST_LIMIT} requests). "
+                           f"Saving progress and stopping.")
                 rate_limited = True
                 break
 
             remaining = target - generated
-            batch_n   = min(BATCH_SIZE, remaining)
+            # Use tier-specific batch size (smaller for complex tiers that produce longer SQL)
+            tier_batch = tier.get("batch_size", BATCH_SIZE)
+            batch_n   = min(tier_batch, remaining)
 
             prompt = build_generation_prompt(
                 tier,
@@ -761,12 +786,17 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
             )
 
             try:
+                # Apply per-tier throttling before the call
+                tier_interval = tier.get("min_interval", MIN_REQUEST_INTERVAL)
+                elapsed = time.monotonic() - _last_request_time
+                if elapsed < tier_interval:
+                    time.sleep(tier_interval - elapsed)
                 raw = call_gpt(prompt)
                 request_count += 1
             except RateLimitHit as e:
                 tqdm.write(f"\n⛔ Rate limit hit! {e}")
-                tqdm.write(f"   Đã lưu {generated} samples cho Tier {tier_id}.")
-                tqdm.write(f"   Chạy lại script sau khi quota reset để tiếp tục.")
+                tqdm.write(f"   Saved {generated} samples for Tier {tier_id}.")
+                tqdm.write(f"   Re-run the script after quota resets to continue.")
                 rate_limited = True
                 break
 
@@ -796,19 +826,19 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
                         tqdm.write(f"  ✗ DB validation failed: {err[:80]}")
                         continue
 
-                # ── Lưu sample ngay lập tức ────────────────────────
+                # ── Save sample immediately ────────────────────────
                 seen_questions.add(question.lower())
                 recent_questions.append(question)
 
                 sample = build_sample(question, sql)
                 sample["_tier"] = tier_id
                 all_samples.append(sample)
-                append_sample_to_file(sample)  # append vào file
+                append_sample_to_file(sample)  # append to file
 
                 generated += 1
                 pbar.update(1)
 
-                # Cập nhật progress sau mỗi sample
+                # Update progress after every sample
                 progress["current_generated"] = generated
                 progress["seen_questions"] = list(seen_questions)
                 progress["recent_questions"] = recent_questions[-RECENT_QUESTIONS_WINDOW:]
@@ -824,13 +854,13 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         pbar.close()
 
         if rate_limited:
-            # Lưu progress và dừng toàn bộ vòng lặp tier
+            # Save progress and exit the tier loop
             progress["current_generated"] = generated
             save_progress(progress)
-            print(f"  ⏸  Paused tại Tier {tier_id}: {generated}/{target} samples")
+            print(f"  ⏸  Paused at Tier {tier_id}: {generated}/{target} samples")
             break
 
-        # Tier hoàn thành
+        # Tier complete
         print(f"  ✓ Tier {tier_id} done: {generated}/{target} samples")
         completed_tiers.append(tier_id)
         progress["completed_tiers"] = completed_tiers
@@ -846,14 +876,14 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
 
     total = len(all_samples)
     if rate_limited:
-        print(f"\n⏸  Dừng do rate-limit. Đã lưu {total} samples.")
+        print(f"\n⏸  Stopped due to rate-limit. Saved {total} samples.")
         print(f"   Progress: {PROGRESS_FILE}")
-        print(f"   Chạy lại cùng lệnh để tiếp tục từ chỗ dở.")
+        print(f"   Re-run the same command to continue from where it left off.")
     else:
-        # Xóa progress file khi hoàn thành toàn bộ
+        # Delete progress file on full completion
         if PROGRESS_FILE.exists():
             PROGRESS_FILE.unlink()
-        print(f"\n✅ Dataset hoàn thành! {total} samples → {RAW_OUTPUT}")
+        print(f"\n✅ Dataset complete! {total} samples -> {RAW_OUTPUT}")
 
     return all_samples
 
@@ -862,7 +892,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
 # SPLIT: Train / Val / Test
 # ─────────────────────────────────────────────
 def split_dataset(samples: list[dict]) -> None:
-    # Tách T7 (negative) ra riêng để đảm bảo phân bổ đều trong mỗi split
+    # Separate T7 (negative) samples to ensure even distribution across splits
     t7_samples    = [s for s in samples if s.get("_tier") == "T7"]
     other_samples = [s for s in samples if s.get("_tier") != "T7"]
 
@@ -904,6 +934,7 @@ def split_dataset(samples: list[dict]) -> None:
 
     # Per-tier breakdown
     print("\n📊 Tier distribution in each split:")
+
     header = f"  {'Tier':<6} {'Train':>6} {'Val':>6} {'Test':>6}"
     print(header)
     print("  " + "-" * 30)
@@ -928,18 +959,18 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    # Fix Unicode output trên Windows terminal (cp1252 → utf-8)
+    # Fix Unicode output on Windows terminal (cp1252 -> utf-8)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
     parser = argparse.ArgumentParser(description="Text-to-SQL dataset generator")
-    parser.add_argument("--generate",     action="store_true", help="Sinh data mới")
-    parser.add_argument("--split",        action="store_true", help="Split train/val/test từ raw_samples.jsonl")
-    parser.add_argument("--all",          action="store_true", help="Chạy toàn bộ pipeline (generate → dedup → split)")
-    parser.add_argument("--validate-sql", action="store_true", help="Validate SQL trên DB thật (yêu cầu SQL_CONN_STR trong .env)")
-    parser.add_argument("--dedup-only",   action="store_true", help="Chỉ chạy semantic dedup trên raw_samples.jsonl có sẵn")
+    parser.add_argument("--generate",     action="store_true", help="Generate new data")
+    parser.add_argument("--split",        action="store_true", help="Split train/val/test from raw_samples.jsonl")
+    parser.add_argument("--all",          action="store_true", help="Run full pipeline (generate -> dedup -> split)")
+    parser.add_argument("--validate-sql", action="store_true", help="Validate SQL against real DB (requires SQL_CONN_STR in .env)")
+    parser.add_argument("--dedup-only",   action="store_true", help="Run semantic dedup only on existing raw_samples.jsonl")
     args = parser.parse_args()
 
     samples: list[dict] = []
@@ -948,7 +979,7 @@ if __name__ == "__main__":
     if args.all or args.generate:
         samples = generate_dataset(validate_sql_db=args.validate_sql)
 
-    # ── Step 2: Load existing raw (nếu không generate) ────
+    # ── Step 2: Load existing raw (if not generating) ────
     if (args.split or args.dedup_only) and not samples:
         with open(RAW_OUTPUT, encoding="utf-8") as f:
             for line in f:
@@ -956,17 +987,17 @@ if __name__ == "__main__":
                 if line:
                     samples.append(json.loads(line))
         print(f"Loaded {len(samples)} samples from {RAW_OUTPUT}")
-        # Khôi phục _tier từ messages nếu cần (cho coverage report)
+        # Restore _tier from messages if needed (for coverage report)
         report_operator_coverage(samples)
 
     # ── Step 3: Semantic dedup ────────────────
     if args.all or args.dedup_only:
         samples = semantic_dedup(samples)
-        # Lưu lại file raw đã dedup
+        # Save deduped raw file
         with open(RAW_OUTPUT, "w", encoding="utf-8") as f:
             for s in samples:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
-        print(f"✅ Deduped dataset saved → {RAW_OUTPUT} ({len(samples)} samples)")
+        print(f"✅ Deduped dataset saved -> {RAW_OUTPUT} ({len(samples)} samples)")
 
     # ── Step 4: Split ─────────────────────────
     if args.all or args.split:
@@ -974,9 +1005,9 @@ if __name__ == "__main__":
 
     if not any([args.generate, args.split, args.all, args.dedup_only]):
         print("Usage:")
-        print("  python generate_data.py --all                  # Sinh + dedup + split")
-        print("  python generate_data.py --all --validate-sql   # Như trên + validate SQL trên DB")
-        print("  python generate_data.py --generate             # Chỉ sinh data")
-        print("  python generate_data.py --dedup-only           # Chỉ dedup raw có sẵn")
-        print("  python generate_data.py --split                # Chỉ split từ raw có sẵn")
+        print("  python generate_data.py --all                  # Generate + dedup + split")
+        print("  python generate_data.py --all --validate-sql   # Same + validate SQL against DB")
+        print("  python generate_data.py --generate             # Generate data only")
+        print("  python generate_data.py --dedup-only           # Run dedup on existing raw")
+        print("  python generate_data.py --split                # Split from existing raw")
 
