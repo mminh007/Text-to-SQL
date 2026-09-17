@@ -30,6 +30,8 @@ Resume after rate-limit:
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import random
 import re
@@ -97,11 +99,31 @@ BATCH_SIZE    = 5                  # number of samples per API call
 # Example: quota 200k TPD, ~500 tokens per request -> set 350 to be safe.
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "0"))
 
-# ── Proactive RPM throttle ────────────────────────────────────────
-# qwen/qwen3.8-27b: 30 RPM -> min ~2s between requests to avoid bursting.
-# Adjust MIN_REQUEST_INTERVAL if using a different model.
-MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "2.5"))  # seconds
-_last_request_time: float = 0.0  # timestamp of the most recent request
+# ── OTPM (Output Tokens Per Minute) budget ───────────────────────
+# Groq free tier: 1000 OTPM for qwen/qwen3.8-27b.
+# min_interval is auto-computed per-tier based on tokens_per_sample * batch_size.
+# Override with MIN_REQUEST_INTERVAL to force a fixed floor.
+OTPM_LIMIT           = int(os.getenv("OTPM_LIMIT", "1000"))   # tokens per minute
+OTPM_SAFETY_FACTOR   = float(os.getenv("OTPM_SAFETY_FACTOR", "1.3"))  # 30% headroom
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "2.5"))  # hard floor (seconds)
+_last_request_time: float = 0.0  # timestamp of the most recent API call
+
+
+def compute_min_interval(batch_size: int, tokens_per_sample: int) -> float:
+    """
+    Compute the minimum seconds between requests to stay within OTPM_LIMIT.
+
+    Formula:
+        tokens_per_request = batch_size * tokens_per_sample
+        requests_per_min   = OTPM_LIMIT / tokens_per_request   (with safety factor)
+        min_interval (s)   = 60 / requests_per_min
+    """
+    tokens_per_request = batch_size * tokens_per_sample
+    safe_otpm = OTPM_LIMIT / OTPM_SAFETY_FACTOR
+    requests_per_min = safe_otpm / tokens_per_request
+    computed = 60.0 / requests_per_min
+    return max(computed, MIN_REQUEST_INTERVAL)
+
 
 # Diversity / dedup
 DEDUP_SIMILARITY_THRESHOLD = 0.92  # cosine sim >= this threshold -> near-duplicate
@@ -114,6 +136,33 @@ client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url=LLM_BASE_URL,
 )
+
+# ─────────────────────────────────────────────
+# LOGGING SETUP
+# ─────────────────────────────────────────────
+LOG_FILE = os.getenv("LOG_FILE", str(OUTPUT_DIR / "run.log"))
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# File handler: rotates at 5 MB, keeps 3 backups
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(_log_formatter)
+
+# Console handler (INFO+)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+_console_handler.setLevel(logging.WARNING)  # only warnings+ to stdout (tqdm handles info)
+
+logger = logging.getLogger("text2sql")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_file_handler)
+logger.addHandler(_console_handler)
+logger.propagate = False
 
 # ─────────────────────────────────────────────
 # COMPACT SCHEMA
@@ -173,11 +222,12 @@ SCHEMA:
 TIERS = [
     {
         "id": "T1",
-        "count": 900,   # ↑ from 600
+        "count": 900,
         "label": "Single table, simple SELECT",
-        # Simple SQL: short output (~50-80 tokens/sample) -> batch=5 is fine within 1000 OTPM
+        # Short SQL: ~60 tokens/sample. batch=5 -> 300 tokens/req.
+        # compute_min_interval(5, 60) -> ~12s, but floor=2.5s is fine here.
         "batch_size": 5,
-        "min_interval": 2.5,  # seconds between requests
+        "tokens_per_sample": 60,   # estimated average output tokens per sample
         "examples": [
             "Liệt kê tất cả nghệ sĩ theo thứ tự tên",
             "Có bao nhiêu bài hát trong hệ thống?",
@@ -193,11 +243,11 @@ TIERS = [
     },
     {
         "id": "T2",
-        "count": 1100,  # ↑ from 800
+        "count": 1100,
         "label": "WHERE, ORDER BY, GROUP BY, Aggregation",
-        # Moderate SQL length (~80-120 tokens/sample) -> batch=5 still safe
+        # Moderate SQL: ~100 tokens/sample. batch=5 -> 500 tokens/req -> 2 req/min safe.
         "batch_size": 5,
-        "min_interval": 2.5,
+        "tokens_per_sample": 100,
         "examples": [
             "Album nào được phát hành sau năm 2015?",
             "Bài hát dài hơn 5 phút có những bài nào?",
@@ -213,11 +263,12 @@ TIERS = [
     },
     {
         "id": "T3",
-        "count": 1000,  # ↑ from 700
+        "count": 1000,
         "label": "2-table JOIN",
-        # 2-table JOIN: ~100-150 tokens/sample -> batch=5 -> ~500-750 tokens/req, borderline
+        # 2-table JOIN: ~130 tokens/sample. batch=4 -> 520 tokens/req.
+        # compute_min_interval(4, 130) -> ~38s. Safe.
         "batch_size": 4,
-        "min_interval": 5.0,  # slightly slower to avoid OTPM spikes
+        "tokens_per_sample": 130,
         "examples": [
             "Liệt kê tên bài hát cùng tên nghệ sĩ",
             "Mỗi album có bao nhiêu bài hát?",
@@ -233,12 +284,12 @@ TIERS = [
     },
     {
         "id": "T4",
-        "count": 800,   # ↑ from 600
+        "count": 800,
         "label": "Multi-table JOIN (3+ tables)",
-        # Complex SQL: ~150-250 tokens/sample -> batch=3 -> ~450-750 tokens/req
-        # With 1000 OTPM limit: need >= 45s between requests to be safe
-        "batch_size": 3,
-        "min_interval": 20.0,  # ~3 req/min -> max 750 output tokens/min
+        # Complex SQL: ~200 tokens/sample. batch=2 -> 400 tokens/req.
+        # compute_min_interval(2, 200) -> ~31s.
+        "batch_size": 2,
+        "tokens_per_sample": 200,
         "examples": [
             "Top 10 bài hát được nghe nhiều nhất, kèm tên nghệ sĩ và album",
             "Bài hát thuộc thể loại Synthwave là những bài nào, tên nghệ sĩ là ai?",
@@ -252,11 +303,13 @@ TIERS = [
     },
     {
         "id": "T5",
-        "count": 600,   # ↑ from 400
+        "count": 600,
         "label": "Subquery, CTE, HAVING",
-        # Subquery/CTE: ~150-250 tokens/sample, same risk as T4
-        "batch_size": 3,
-        "min_interval": 20.0,
+        # Subquery/CTE: ~220 tokens/sample. batch=2 -> 440 tokens/req.
+        # compute_min_interval(2, 220) -> ~34s.
+        # Previously batch=3 -> 660 tokens/req -> burst > 1000 OTPM -> FIX: batch=2
+        "batch_size": 2,
+        "tokens_per_sample": 220,
         "examples": [
             "Nghệ sĩ nào có trung bình số bài mỗi album cao nhất?",
             "User nào nghe nhiều hơn mức trung bình?",
@@ -269,11 +322,12 @@ TIERS = [
     },
     {
         "id": "T6",
-        "count": 325,   # ↑ from 200
+        "count": 325,
         "label": "Window Functions, Ranking",
-        # Window functions: ~200-300 tokens/sample (verbose SQL with OVER/PARTITION BY)
+        # Window functions: ~250 tokens/sample. batch=2 -> 500 tokens/req.
+        # compute_min_interval(2, 250) -> ~39s.
         "batch_size": 2,
-        "min_interval": 25.0,  # ~2.4 req/min -> max 600 output tokens/min
+        "tokens_per_sample": 250,
         "examples": [
             "Xếp hạng bài hát theo lượt nghe trong từng thể loại",
             "Tính thứ hạng nghệ sĩ theo số album",
@@ -284,11 +338,11 @@ TIERS = [
     },
     {
         "id": "T7",
-        "count": 275,   # ↑ from 200
+        "count": 275,
         "label": "Negative / Refusal cases",
-        # Refusal responses are very short (~20-30 tokens each) -> batch=5 is fine
+        # Refusal: ~25 tokens/sample. batch=5 -> 125 tokens/req -> very safe.
         "batch_size": 5,
-        "min_interval": 5.0,
+        "tokens_per_sample": 25,
         "examples": [
             "Xóa tất cả bài hát của Radiohead",
             "Cập nhật tên nghệ sĩ thành 'Unknown'",
@@ -352,34 +406,48 @@ Chỉ trả về JSON array, không giải thích gì thêm."""
 # RATE-LIMIT EXCEPTION
 # ─────────────────────────────────────────────
 class RateLimitHit(Exception):
-    """Raised when the API returns 429 repeatedly beyond the allowed retry count."""
+    """Raised when the API returns 429 (OTPM/RPM) repeatedly beyond the allowed retry count."""
     def __init__(self, retry_after: float = 0):
-        self.retry_after = retry_after  # seconds to wait (from header or message)
+        self.retry_after = retry_after
         super().__init__(f"Rate limit reached. Retry after {retry_after:.0f}s")
+
+
+class RequestTooLarge(Exception):
+    """Raised when the API returns 429 with 'Request too large' — prompt exceeds context limit."""
+    pass
 
 
 def _parse_retry_after(err_str: str) -> float:
     """
     Parse the retry wait time from a Groq error message.
 
-    Groq typically returns formats like:
+    Groq returns formats like:
       - "Please try again in 2m30s"  -> 150.0
       - "try again in 45.5s"          -> 45.5
       - "retry after 60 seconds"      -> 60.0
-      - "rate_limit_exceeded"         -> 0.0 (fallback)
+      - "try again in 300ms"          ->  0.0  (treat sub-second as 'no wait')
+      - "rate_limit_exceeded"         ->  0.0  (fallback)
+
+    IMPORTANT: milliseconds (ms) must be matched BEFORE the minutes regex,
+    otherwise '300ms' is misread as '300 minutes' (18 000 s).
     """
-    # Format "XmYs" or "Xm Ys" (e.g. "2m30s", "1m 5.2s")
+    # ── Milliseconds: "300ms", "500 ms" ─────────────────────────────
+    # Return 0.0 so the caller falls back to the safe tier_interval.
+    if re.search(r"\d+\s*ms\b", err_str, re.IGNORECASE):
+        return 0.0
+
+    # ── Combined "XmYs" / "Xm Ys" (e.g. "2m30s", "1m 5.2s") ────────
     m = re.search(r"(\d+)\s*m(?:in)?\s*(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 60 + float(m.group(2))
 
-    # Minutes only: "2m"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*m(?:in)?(?:ute)?s?\b", err_str, re.IGNORECASE)
+    # ── Minutes only: "2m", "2min", "2mins" (NOT followed by 's' that would make 'ms') ──
+    m = re.search(r"(\d+(?:\.\d+)?)\s*min(?:ute)?s?\b", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 60
 
-    # Seconds only: "45s", "45 seconds", "45.5s"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?", err_str, re.IGNORECASE)
+    # ── Seconds only: "45s", "45 seconds", "45.5s" ─────────────────
+    m = re.search(r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b", err_str, re.IGNORECASE)
     if m:
         return float(m.group(1))
 
@@ -389,30 +457,41 @@ def _parse_retry_after(err_str: str) -> float:
 # ─────────────────────────────────────────────
 # API CALL WITH RETRY
 # ─────────────────────────────────────────────
-def call_gpt(prompt: str, max_retries: int = 5) -> Optional[str]:
+def call_gpt(
+    prompt: str,
+    min_interval: float = MIN_REQUEST_INTERVAL,
+    max_retries: int = 5,
+) -> Optional[str]:
     """
     Call the LLM API with proactive throttling and smart retry on 429.
 
     Strategy:
-    - Ensure MIN_REQUEST_INTERVAL seconds between requests (avoids bursting).
-    - On 429: wait exactly retry-after seconds then retry (up to 3 times).
-    - If retry_after = 0 (parse failed): use exponential backoff 10s -> 20s -> 40s.
-    - After exhausting retries on 429 -> raise RateLimitHit (graceful stop).
-    - Other errors (5xx, timeout): short exponential backoff then retry.
+    - Enforce `min_interval` seconds since the LAST request before sending.
+      (Caller computes the correct interval per tier via compute_min_interval.)
+    - On 429: wait exactly retry-after seconds, then enforce min_interval again.
+    - If retry_after = 0 (parse failed): exponential backoff 10s → 20s → 40s.
+    - After exhausting retries on 429 → raise RateLimitHit (graceful stop).
+    - Other errors (5xx, timeout, network): short exponential backoff then retry.
+
+    NOTE: Throttle is handled HERE only. Callers must NOT sleep before calling
+    this function — doing so would double-count the wait time.
     """
     global _last_request_time
 
-    # ── Proactive throttle: enforce minimum gap between requests ──
+    # ── Enforce minimum gap since last request ──────────────────────
     elapsed = time.monotonic() - _last_request_time
-    if elapsed < MIN_REQUEST_INTERVAL:
-        time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+    if elapsed < min_interval:
+        sleep_time = min_interval - elapsed
+        logger.debug(f"Throttle: sleeping {sleep_time:.1f}s (interval={min_interval:.1f}s)")
+        time.sleep(sleep_time)
 
     rate_limit_attempts = 0
-    max_rate_limit_retries = 3  # number of 429 retries before signalling a stop
+    max_rate_limit_retries = 5
 
     for attempt in range(max_retries):
         try:
             _last_request_time = time.monotonic()
+            logger.debug(f"API call attempt {attempt + 1}/{max_retries}")
             response = client.chat.completions.create(
                 model=MODEL,
                 temperature=TEMPERATURE,
@@ -421,35 +500,67 @@ def call_gpt(prompt: str, max_retries: int = 5) -> Optional[str]:
                     {"role": "user", "content": prompt},
                 ],
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+
+            # Log token usage if available
+            usage = getattr(response, "usage", None)
+            if usage:
+                logger.info(
+                    f"API OK | prompt_tokens={usage.prompt_tokens} "
+                    f"output_tokens={usage.completion_tokens} "
+                    f"total={usage.total_tokens}"
+                )
+            else:
+                logger.info("API OK | (usage info not available)")
+
+            return content
 
         except Exception as e:
             err_str = str(e)
 
-            # ── 429 Rate limit ────────────────────────────────────────
+            # ── 429: Request too large (prompt exceeds context window) ───────
+            # Groq returns 429 with "Request too large" when the INPUT tokens are
+            # over the model limit. Retrying with the same prompt won't help.
+            # Signal the caller to reduce the prompt (trim recent_questions).
+            if ("429" in err_str or "rate_limit_exceeded" in err_str) and (
+                "request too large" in err_str.lower() or "context_length_exceeded" in err_str.lower()
+            ):
+                logger.warning(f"Request too large — prompt too long. Signalling trim. | {err_str[:160]}")
+                raise RequestTooLarge(err_str)
+
+            # ── 429 OTPM / RPM rate-limit ─────────────────────────────────
             if "429" in err_str or "rate_limit_exceeded" in err_str or "rate limit" in err_str.lower():
                 rate_limit_attempts += 1
                 retry_after = _parse_retry_after(err_str)
 
                 if rate_limit_attempts >= max_rate_limit_retries:
-                    # Exhausted retries -> signal graceful stop
+                    logger.error(
+                        f"429 exhausted after {max_rate_limit_retries} retries. "
+                        f"Raising RateLimitHit. | raw: {err_str[:200]}"
+                    )
                     raise RateLimitHit(retry_after)
 
-                # Fallback: if parse returns 0s, use backoff 10s, 20s, 40s
+                # retry_after=0 -> use exponential backoff capped at min_interval
                 wait = retry_after if retry_after > 0 else (10 * (2 ** (rate_limit_attempts - 1)))
-                print(
-                    f" \n⚠ 429 Rate limit (attempt {rate_limit_attempts}/{max_rate_limit_retries}): "
-                    f"waiting {wait:.0f}s then retrying... | raw: {err_str[:120]}"
+                wait_total = max(wait, min_interval)
+                msg = (
+                    f"429 rate_limit (attempt {rate_limit_attempts}/{max_rate_limit_retries}): "
+                    f"retry_after={retry_after:.1f}s | waiting {wait_total:.0f}s"
                 )
-                time.sleep(wait)
-                _last_request_time = time.monotonic()  # reset after waiting
+                logger.warning(msg)
+                tqdm.write(f"\n⚠ {msg} | raw: {err_str[:120]}")
+                time.sleep(wait_total)
+                _last_request_time = time.monotonic()
                 continue
 
             # ── Other errors (5xx, timeout, network) ─────────────────────
             wait = 2 ** attempt
-            print(f"  \n⚠ API error (attempt {attempt+1}/{max_retries}): {e}. Retry in {wait}s...")
+            msg = f"API error (attempt {attempt + 1}/{max_retries}): {e}. Retry in {wait}s..."
+            logger.warning(msg)
+            tqdm.write(f"\n⚠ {msg}")
             time.sleep(wait)
 
+    logger.error("call_gpt: exhausted all retries, returning None")
     return None
 
 
@@ -736,6 +847,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         # ── Skip completed tiers ────────────────────────────────
         if tier_id in completed_tiers:
             print(f"\n⏭  Tier {tier_id} ({label}): already completed, skipping.")
+            logger.info(f"[{tier_id}] Skipping — already completed")
             continue
 
         # ── Count samples already generated for this tier ─────────────────────
@@ -744,13 +856,26 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         if progress["current_tier"] == tier_id:
             generated = max(generated, progress["current_generated"])
 
+        # ── Compute safe min_interval based on OTPM budget ────────────────
+        tier_batch          = tier.get("batch_size", BATCH_SIZE)
+        tokens_per_sample   = tier.get("tokens_per_sample", 150)
+        tier_interval       = compute_min_interval(tier_batch, tokens_per_sample)
+
         print(f"\n{'='*60}")
         print(f"Tier {tier_id}: {label}")
         print(f"Target: {target} | Already: {generated} | Remaining: {target - generated}")
+        print(f"batch_size={tier_batch} | tokens_per_sample~{tokens_per_sample} | "
+              f"min_interval={tier_interval:.1f}s (OTPM_LIMIT={OTPM_LIMIT})")
         print(f"{'='*60}")
+        logger.info(
+            f"[{tier_id}] Starting | target={target} already={generated} "
+            f"batch={tier_batch} tokens_per_sample={tokens_per_sample} "
+            f"min_interval={tier_interval:.1f}s"
+        )
 
         if generated >= target:
             print(f"  ✓ Tier {tier_id} already has enough samples, marking as complete.")
+            logger.info(f"[{tier_id}] Already complete — marking done")
             if tier_id not in completed_tiers:
                 completed_tiers.append(tier_id)
             progress["completed_tiers"] = completed_tiers
@@ -769,14 +894,13 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
         while generated < target:
             # ── Check request limit before calling the API ───────────
             if DAILY_REQUEST_LIMIT > 0 and request_count >= DAILY_REQUEST_LIMIT:
-                tqdm.write(f"\n🛑 Reached DAILY_REQUEST_LIMIT ({DAILY_REQUEST_LIMIT} requests). "
-                           f"Saving progress and stopping.")
+                msg = f"Reached DAILY_REQUEST_LIMIT ({DAILY_REQUEST_LIMIT} requests). Stopping."
+                tqdm.write(f"\n🛑 {msg}")
+                logger.warning(f"[{tier_id}] {msg}")
                 rate_limited = True
                 break
 
             remaining = target - generated
-            # Use tier-specific batch size (smaller for complex tiers that produce longer SQL)
-            tier_batch = tier.get("batch_size", BATCH_SIZE)
             batch_n   = min(tier_batch, remaining)
 
             prompt = build_generation_prompt(
@@ -785,25 +909,42 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
                 recent_questions=recent_questions if recent_questions else None,
             )
 
+            logger.info(
+                f"[{tier_id}] Request #{request_count + 1} | "
+                f"batch={batch_n} | generated={generated}/{target} | "
+                f"interval={tier_interval:.1f}s"
+            )
+
             try:
-                # Apply per-tier throttling before the call
-                tier_interval = tier.get("min_interval", MIN_REQUEST_INTERVAL)
-                elapsed = time.monotonic() - _last_request_time
-                if elapsed < tier_interval:
-                    time.sleep(tier_interval - elapsed)
-                raw = call_gpt(prompt)
+                # Single throttle point: delegate entirely to call_gpt(min_interval)
+                # Do NOT sleep here — call_gpt() handles it.
+                raw = call_gpt(prompt, min_interval=tier_interval)
                 request_count += 1
+            except RequestTooLarge:
+                # Prompt too long: trim the recent_questions avoid-block and retry immediately.
+                old_len = len(recent_questions)
+                recent_questions = recent_questions[len(recent_questions) // 2:]  # drop oldest half
+                msg = (
+                    f"Prompt too large \u2014 trimming recent_questions "
+                    f"{old_len} \u2192 {len(recent_questions)} and retrying"
+                )
+                tqdm.write(f"\n\u26a0 {msg}")
+                logger.warning(f"[{tier_id}] {msg}")
+                continue  # rebuild prompt with shorter avoid-block, no extra sleep
             except RateLimitHit as e:
-                tqdm.write(f"\n⛔ Rate limit hit! {e}")
+                msg = f"Rate limit hit after retries: {e}"
+                tqdm.write(f"\n\u26d4 {msg}")
+                logger.error(f"[{tier_id}] {msg} | saved={generated}/{target}")
                 tqdm.write(f"   Saved {generated} samples for Tier {tier_id}.")
                 tqdm.write(f"   Re-run the script after quota resets to continue.")
                 rate_limited = True
                 break
 
             if raw is None:
-                tqdm.write("  ✗ Failed to get response, skipping batch")
+                tqdm.write("  \u2717 Failed to get response, skipping batch")
                 time.sleep(2)
                 continue
+
 
             pairs = parse_pairs(raw)
 
@@ -837,6 +978,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
 
                 generated += 1
                 pbar.update(1)
+                logger.debug(f"[{tier_id}] Saved sample {generated}/{target}: {question[:60]}")
 
                 # Update progress after every sample
                 progress["current_generated"] = generated
@@ -849,7 +991,7 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
                 if generated >= target:
                     break
 
-            time.sleep(0.5)
+            # No extra sleep — call_gpt() enforces tier_interval
 
         pbar.close()
 
@@ -858,10 +1000,12 @@ def generate_dataset(validate_sql_db: bool = False) -> list[dict]:
             progress["current_generated"] = generated
             save_progress(progress)
             print(f"  ⏸  Paused at Tier {tier_id}: {generated}/{target} samples")
+            logger.warning(f"[{tier_id}] Paused due to rate-limit: {generated}/{target} saved")
             break
 
         # Tier complete
         print(f"  ✓ Tier {tier_id} done: {generated}/{target} samples")
+        logger.info(f"[{tier_id}] Complete: {generated}/{target} samples")
         completed_tiers.append(tier_id)
         progress["completed_tiers"] = completed_tiers
         progress["current_tier"] = None
