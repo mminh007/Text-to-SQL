@@ -1,0 +1,33 @@
+# requirements/training.txt
+# Phase 2 — QLoRA fine-tuning on GPU (vast.ai / Colab)
+# Install with: pip install -r requirements/training.txt
+#
+# NOTE: Install torch FIRST (CUDA) before unsloth, e.g.:
+#   pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements/training.txt
+
+-r base.txt
+
+# ── Unsloth (QLoRA trainer, must be installed after torch) ────────────────────
+# See: https://github.com/unslothai/unsloth#installation
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+# Alternative: pip install "unsloth[cu121-torch230]" (pinned CUDA/torch version)
+
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+transformers>=4.45.0
+datasets>=2.21.0
+peft>=0.12.0
+trl>=0.11.0
+accelerate>=0.34.0
+bitsandbytes>=0.43.0
+
+# ── Tokenizer & Data ──────────────────────────────────────────────────────────
+tokenizers>=0.20.0
+sentencepiece>=0.2.0
+
+# ── Logging / Monitoring ──────────────────────────────────────────────────────
+tensorboard>=2.17.0
+# wandb>=0.17.0  # uncomment if using W&B
+
+# ── Evaluation (SQL parsing) ──────────────────────────────────────────────────
+sqlglot>=25.0.0

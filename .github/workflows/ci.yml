@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Lint & Format ───────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install linting tools
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check src/
+
+  # ── Data validation ─────────────────────────────────────────────────────────
+  validate-data:
+    name: Validate dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install base dependencies
+        run: pip install -r requirements/base.txt
+      - name: Validate train split
+        # Skipped if data/ is in .gitignore — runs locally or on self-hosted runner
+        run: |
+          if [ -f data/train.jsonl ]; then
+            python src/data/validate.py --input data/train.jsonl
+          else
+            echo "data/train.jsonl not found — skipping (expected in .gitignore)"
+          fi
+
+  # ── Unit tests ──────────────────────────────────────────────────────────────
+  # TODO (Phase 3): Add pytest unit tests
+  # test:
+  #   name: Unit tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: "3.11"
+  #     - run: pip install pytest -r requirements/base.txt
+  #     - run: pytest tests/ -v

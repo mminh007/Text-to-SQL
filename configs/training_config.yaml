@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# configs/training_config.yaml
+# QLoRA fine-tune config for Qwen2.5-7B-Instruct on Koel Music SQL dataset
+# Consistent with decisions in docs/finetune_plan.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  max_seq_length: 4096
+  load_in_4bit: true          # QLoRA: 4-bit NF4 quantization
+  dtype: null                  # null = auto-detect (bfloat16 on Ampere+)
+
+# ── LoRA (QLoRA) ───────────────────────────────────────────────────────────────
+lora:
+  r: 16                        # rank — controls capacity vs VRAM tradeoff
+  alpha: 32                    # scaling = alpha / r = 2.0
+  dropout: 0.0                 # 0 = no dropout (Unsloth recommendation)
+  bias: "none"
+  use_gradient_checkpointing: "unsloth"   # saves ~30% VRAM
+  random_state: 42
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# ── Data ───────────────────────────────────────────────────────────────────────
+data:
+  train_file: "data/train.jsonl"
+  val_file:   "data/val.jsonl"
+  system_prompt_file: "prompts/system_prompt.txt"
+  # Chat template: use Qwen's built-in template via tokenizer
+  # Format: [system] → [user] → [assistant]
+  packing: false               # disable packing (samples of varying length)
+
+# ── Training ───────────────────────────────────────────────────────────────────
+training:
+  output_dir: "outputs/qwen25-7b-koel-sql"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4    # effective batch = 4 × 4 = 16
+  gradient_checkpointing: true
+  optim: "adamw_8bit"               # 8-bit AdamW (Unsloth)
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  fp16: false                        # use bf16 instead
+  bf16: true                         # bfloat16 (Ampere GPU required)
+  seed: 42
+  dataloader_num_workers: 2
+
+# ── Evaluation & Checkpointing ─────────────────────────────────────────────────
+evaluation:
+  strategy: "steps"
+  eval_steps: 100
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging:
+  logging_steps: 10
+  report_to: "tensorboard"           # change to "wandb" if W&B is configured
+  run_name: "qwen25-7b-koel-sql-qlora"
+
+# ── Merge & Export ─────────────────────────────────────────────────────────────
+export:
+  merge_adapter: true                # merge LoRA weights into base model after training
+  push_to_hub: false                 # set true to upload to HuggingFace Hub
+  hub_model_id: ""                   # e.g. "your-username/qwen25-koel-sql"
+  save_method: "merged_16bit"        # options: merged_16bit, merged_4bit, lora

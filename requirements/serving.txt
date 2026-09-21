@@ -1,0 +1,27 @@
+# requirements/serving.txt
+# Phase 4 — API serving + inference
+# Install with: pip install -r requirements/serving.txt
+
+-r base.txt
+
+# ── API Framework ─────────────────────────────────────────────────────────────
+fastapi>=0.114.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.9.0
+
+# ── Inference ─────────────────────────────────────────────────────────────────
+# Option A: vLLM (production, GPU required)
+# vllm>=0.6.0
+
+# Option B: transformers (fallback, slower)
+transformers>=4.45.0
+torch>=2.3.0
+accelerate>=0.34.0
+
+# ── SQL Execution ─────────────────────────────────────────────────────────────
+sqlglot>=25.0.0
+sqlalchemy>=2.0.0
+pyodbc>=5.0.0          # SQL Server (Windows ODBC Driver 17)
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+openai>=1.0.0          # For result interpretation step

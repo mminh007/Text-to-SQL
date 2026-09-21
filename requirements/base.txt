@@ -1,0 +1,6 @@
+# requirements/base.txt
+# Shared across all environments
+
+python-dotenv>=1.0.0
+pyyaml>=6.0
+tqdm>=4.66.0

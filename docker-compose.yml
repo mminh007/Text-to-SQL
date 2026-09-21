@@ -5,18 +5,22 @@ services:
       dockerfile: Dockerfile
     image: text-to-sql-generate:latest
     container_name: text-to-sql-generate
-    
-    # Đọc toàn bộ biến từ file .env trên host
     env_file:
       - .env
-
-    # Mount thư mục data ra host để lưu output
     volumes:
       - ./data:/app/data
-
-    # Lệnh mặc định: sinh data + dedup + split
-    # Override khi chạy: docker compose run generate python generate_data.py --generate
-    command: python generate_data.py --all
-
-    # Restart policy: không tự restart (job một lần)
+    # Default: sinh data + dedup + split
+    # Override: docker compose run generate python src/data/generate_data.py --generate
+    command: python src/data/generate_data.py --all
     restart: "no"
+
+  # Phase 4 (placeholder): API serving
+  # api:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.serve
+  #   ports:
+  #     - "8000:8000"
+  #   env_file:
+  #     - .env
+  #   command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
