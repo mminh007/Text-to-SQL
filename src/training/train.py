@@ -140,7 +140,7 @@ def build_training_args(cfg: dict, smoke_test: bool = False):
 
 # ── Main training function ─────────────────────────────────────────────────────
 
-def train(cfg: dict, smoke_test: bool = False):
+def train(cfg: dict, smoke_test: bool = False, resume_from_checkpoint: bool = False):
     """Full QLoRA training pipeline."""
     from trl import SFTTrainer, SFTConfig
 
@@ -205,8 +205,8 @@ def train(cfg: dict, smoke_test: bool = False):
         pass
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    logger.info("Starting training (smoke_test=%s)...", smoke_test)
-    trainer_stats = trainer.train()
+    logger.info("Starting training (smoke_test=%s, resume=%s)...", smoke_test, resume_from_checkpoint)
+    trainer_stats = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # ── Save adapter ──────────────────────────────────────────────────────────
     output_dir = Path(cfg["training"]["output_dir"])
@@ -286,6 +286,11 @@ def parse_args():
         help="Path to training_config.yaml",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint in output_dir (useful for Colab)",
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Quick smoke test: 50 samples, 1 epoch",
@@ -317,7 +322,7 @@ def main():
         adapter_path = args.adapter_path or Path(cfg["training"]["output_dir"])
         merge_adapter(cfg, adapter_path=adapter_path, push_to_hub=args.push_to_hub)
     else:
-        train(cfg, smoke_test=args.smoke_test)
+        train(cfg, smoke_test=args.smoke_test, resume_from_checkpoint=args.resume)
 
 
 if __name__ == "__main__":
