@@ -9,8 +9,7 @@ import os
 import yaml
 import argparse
 from unsloth import FastLanguageModel, is_bfloat16_supported
-from trl import SFTTrainer
-from transformers import TrainingArguments
+from trl import SFTTrainer, SFTConfig
 from src.helpers import EpochCheckpointCallback, TrainLogger
 from src.training.dataset_loader import prepare_datasets
 
@@ -58,8 +57,8 @@ def main(config_path: str, log_dir: str = "logs"):
     
     logger.info("   Train samples: %d | Val samples: %d", len(train_ds), len(val_ds))
 
-    logger.info("⚙️ Configuring TrainingArguments...")
-    training_args = TrainingArguments(
+    logger.info("⚙️ Configuring SFTConfig (TrainingArguments)...")
+    training_args = SFTConfig(
         per_device_train_batch_size=config["training"]["per_device_train_batch_size"],
         gradient_accumulation_steps=config["training"]["gradient_accumulation_steps"],
         warmup_ratio=config["training"]["warmup_ratio"],
@@ -71,7 +70,7 @@ def main(config_path: str, log_dir: str = "logs"):
         logging_steps=config["training"]["logging_steps"],
         save_strategy=config["training"]["save_strategy"],
         save_steps=config["training"]["save_steps"],
-        eval_strategy=config["training"]["eval_strategy"],        
+        eval_strategy=config["training"]["eval_strategy"],
         eval_steps=config["training"]["eval_steps"],
         load_best_model_at_end=config["training"]["load_best_model_at_end"],
         metric_for_best_model=config["training"]["metric_for_best_model"],
@@ -79,7 +78,11 @@ def main(config_path: str, log_dir: str = "logs"):
         output_dir=config["training"]["output_dir"],
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),
-        report_to="none"  # can change to wandb or mlflow later
+        dataset_text_field="text",
+        max_seq_length=config["model"]["max_seq_length"],
+        dataset_num_proc=2,
+        packing=False,
+        report_to="none",  # can change to wandb or mlflow later
     )
 
     # --- Build optional epoch-based checkpoint callback ---
@@ -101,10 +104,6 @@ def main(config_path: str, log_dir: str = "logs"):
         tokenizer=tokenizer,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        dataset_text_field="text",
-        max_seq_length=config["model"]["max_seq_length"],
-        dataset_num_proc=2,  # 4 may cause issues on Colab; 2 is safer
-        packing=False,  # Can be True for faster training but might truncate
         args=training_args,
         callbacks=callbacks if callbacks else None,
     )

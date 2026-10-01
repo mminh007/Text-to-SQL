@@ -68,14 +68,23 @@ REFUSAL_KEYWORDS = [
     "chỉ hỗ trợ truy vấn select", "không có trong schema",
     "không thể trả lời", "không liên quan",
 ]
-VALID_TABLES = {
-    "users", "organizations", "artists", "albums", "songs",
-    "genres", "genre_song", "playlists", "playlist_song", "playlist_user",
-    "playlist_folders", "playlist_playlist_folder", "interactions",
-    "favorites", "ratings", "podcasts", "podcast_user", "radio_stations",
-    "audits", "queue_states", "settings", "agent_conversations",
-    "agent_conversation_messages",
-}
+
+# Import VALID_TABLES từ single source of truth — không hardcode ở đây.
+# Nếu schema thay đổi (thêm/xóa bảng), chỉ sửa src/data/schema.py.
+try:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from src.data.schema import get_all_table_names as _get_tables
+    VALID_TABLES: set[str] = set(_get_tables())
+except ImportError:
+    # Fallback if running evaluate.py standalone without package install
+    VALID_TABLES = {
+        "users", "organizations", "artists", "albums", "songs",
+        "genres", "genre_song", "playlists", "playlist_song", "playlist_user",
+        "playlist_folders", "playlist_playlist_folder", "interactions",
+        "favorites", "ratings", "podcasts", "podcast_user", "radio_stations",
+        "audits", "queue_states", "themes", "transcodes",
+    }
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────

@@ -5,22 +5,49 @@ services:
       dockerfile: Dockerfile
     image: text-to-sql-generate:latest
     container_name: text-to-sql-generate
+
+    # Đọc toàn bộ biến từ file .env trên host
     env_file:
       - .env
+
+    # Mount data/ và logs/ ra host để giữ output & resume state
     volumes:
       - ./data:/app/data
-    # Default: sinh data + dedup + split
-    # Override: docker compose run generate python src/data/generate_data.py --generate
-    command: python src/data/generate_data.py --all
+      - ./logs:/app/logs
+
+    # Mặc định: sinh data + dedup + split
+    # Override khi chạy: xem ví dụ bên dưới
+    command: python -m src.data.generate_data --all
+
+    # Restart policy: không tự restart (one-shot job)
     restart: "no"
 
-  # Phase 4 (placeholder): API serving
-  # api:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.serve
-  #   ports:
-  #     - "8000:8000"
-  #   env_file:
-  #     - .env
-  #   command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+# ─────────────────────────────────────────────
+# Các lệnh hay dùng:
+# ─────────────────────────────────────────────
+#
+# Build image:
+#   docker compose build
+#
+# Sinh data đầy đủ (generate + dedup + split):
+#   docker compose run --rm generate
+#
+# Chỉ generate (không dedup, không split):
+#   docker compose run --rm generate python -m src.data.generate_data --generate
+#
+# Chỉ split từ raw_samples.jsonl đã có:
+#   docker compose run --rm generate python -m src.data.generate_data --split
+#
+# Reprocess system prompt (không gọi API):
+#   docker compose run --rm generate python scripts/reprocess_prompts.py --dry-run
+#   docker compose run --rm generate python scripts/reprocess_prompts.py
+#
+# CoT augment (T3-T6):
+#   docker compose run --rm generate python -m src.data.cot_augment --tiers T4 T5 T6 --max-per-tier 50
+#
+# Schema tools:
+#   docker compose run --rm generate python -m src.data.schema --compact
+#   docker compose run --rm generate python -m src.data.schema --diff   # cần SQL_CONN_STR trong .env
+#
+# Schema linker test:
+#   docker compose run --rm generate python -m src.data.schema_linker "Bài hát nghe nhiều nhất?"

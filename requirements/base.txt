@@ -1,6 +1,5 @@
-# requirements/base.txt
-# Shared across all environments
-
+openai>=1.0.0
 python-dotenv>=1.0.0
-pyyaml>=6.0
 tqdm>=4.66.0
+pyodbc>=5.0.0  # (Windows only) for SQL validation
+sentence-transformers>=2.0.0  # for semantic dedup

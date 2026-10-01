@@ -1,6 +1,6 @@
 model:
   name_or_path: "Qwen/Qwen2.5-7B-Instruct"
-  max_seq_length: 2048
+  max_seq_length: 4096  # increased from 2048: schema(~700t) + CoT(~200t) + SQL T6(~500t) ≈ 1500t, needs headroom
   load_in_4bit: true
 
 lora:
